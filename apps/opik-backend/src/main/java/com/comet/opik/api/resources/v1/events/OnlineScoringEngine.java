@@ -83,6 +83,7 @@ public class OnlineScoringEngine {
     static final String REASON_FIELD_NAME = "reason";
 
     private static final String SPANS_VARIABLE_NAME = "spans";
+    private static final String TRACE_VARIABLE_NAME = "trace";
 
     private static final ObjectMapper OBJECT_MAPPER = JsonUtils.getMapper();
 
@@ -112,9 +113,18 @@ public class OnlineScoringEngine {
             @NonNull LlmAsJudgeCode evaluatorCode, Trace trace,
             StructuredOutputStrategy structuredOutputStrategy, @NonNull PromptType promptType,
             @NonNull List<Span> spans) {
+        return prepareLlmRequest(evaluatorCode, trace, structuredOutputStrategy, promptType, spans, null);
+    }
+
+    public static ChatRequest prepareLlmRequest(
+            @NonNull LlmAsJudgeCode evaluatorCode, Trace trace,
+            StructuredOutputStrategy structuredOutputStrategy, @NonNull PromptType promptType,
+            @NonNull List<Span> spans, String traceStructureJson) {
         Map<String, String> replacements = toReplacements(evaluatorCode.variables(), trace);
         injectSpansIntoReplacements(replacements, evaluatorCode.variables(),
                 evaluatorCode.messages(), promptType, spans);
+        injectTraceIntoReplacements(replacements, evaluatorCode.variables(),
+                evaluatorCode.messages(), promptType, traceStructureJson);
         var renderedMessages = renderMessagesWithReplacements(evaluatorCode.messages(), replacements, promptType);
         return buildChatRequest(renderedMessages, evaluatorCode.schema(), structuredOutputStrategy);
     }
@@ -131,9 +141,20 @@ public class OnlineScoringEngine {
             @NonNull LlmAsJudgeCode evaluatorCode, Trace trace,
             StructuredOutputStrategy structuredOutputStrategy, @NonNull PromptType promptType,
             int maxReplacementChars, @NonNull String drillDownHint, @NonNull List<Span> spans) {
+        return prepareLlmRequest(evaluatorCode, trace, structuredOutputStrategy, promptType,
+                maxReplacementChars, drillDownHint, spans, null);
+    }
+
+    public static ChatRequest prepareLlmRequest(
+            @NonNull LlmAsJudgeCode evaluatorCode, Trace trace,
+            StructuredOutputStrategy structuredOutputStrategy, @NonNull PromptType promptType,
+            int maxReplacementChars, @NonNull String drillDownHint, @NonNull List<Span> spans,
+            String traceStructureJson) {
         Map<String, String> replacements = toReplacements(evaluatorCode.variables(), trace);
         injectSpansIntoReplacements(replacements, evaluatorCode.variables(),
                 evaluatorCode.messages(), promptType, spans);
+        injectTraceIntoReplacements(replacements, evaluatorCode.variables(),
+                evaluatorCode.messages(), promptType, traceStructureJson);
         Map<String, String> capped = capReplacements(replacements, maxReplacementChars, drillDownHint);
         var renderedMessages = renderMessagesWithReplacements(evaluatorCode.messages(), capped, promptType);
         return buildChatRequest(renderedMessages, evaluatorCode.schema(), structuredOutputStrategy);
@@ -185,6 +206,34 @@ public class OnlineScoringEngine {
                 .flatMap(OnlineScoringEngine::renderableTextOf)
                 .anyMatch(text -> TemplateParseUtils.extractVariables(text, promptType)
                         .contains(SPANS_VARIABLE_NAME));
+    }
+
+    /**
+     * Whether the rule references the {@code {{trace}}} structure variable — the declarative
+     * signal that the judge needs the agentic-tools loop (it injects the trace id, span ids and
+     * attachment {@code file_name}s into the prompt so the judge can call {@code get_attachment}
+     * without fabricating ids). Mirrors {@link #templateReferencesSpans} exactly: either a
+     * sentinel-valued variable (value is the bare string {@code "trace"}) or a direct
+     * {@code {{trace}}} reference in a message template with no custom variable binding.
+     */
+    public static boolean templateReferencesTraceStructure(
+            @NonNull List<LlmAsJudgeMessage> messages,
+            @NonNull Map<String, String> variables,
+            @NonNull PromptType promptType) {
+        return variables.containsValue(TRACE_VARIABLE_NAME)
+                || messagesReferenceTraceDirectly(messages, variables, promptType);
+    }
+
+    private static boolean messagesReferenceTraceDirectly(
+            List<LlmAsJudgeMessage> messages, Map<String, String> variables, PromptType promptType) {
+        if (variables.containsKey(TRACE_VARIABLE_NAME)) {
+            return false;
+        }
+        return messages.stream()
+                .filter(Objects::nonNull)
+                .flatMap(OnlineScoringEngine::renderableTextOf)
+                .anyMatch(text -> TemplateParseUtils.extractVariables(text, promptType)
+                        .contains(TRACE_VARIABLE_NAME));
     }
 
     /**
@@ -252,6 +301,34 @@ public class OnlineScoringEngine {
         });
         if (templateOnly) {
             replacements.put(SPANS_VARIABLE_NAME, spansJson);
+        }
+    }
+
+    /**
+     * Replace any variable whose source path is the {@code "trace"} sentinel (and the implicit
+     * {@code {{trace}}} reference) with the pre-built trace structure JSON. The structure is built
+     * upstream in the scorer (it needs a reactive attachment fetch), so this just substitutes the
+     * ready string — mirror of {@link #injectSpansIntoReplacements} otherwise. A null structure
+     * renders as {@code "{}"} so a sentinel-mapped {@code trace} variable never leaks the bare word
+     * "trace" into the prompt (same rationale as the spans {@code "[]"} fallback). No-op when
+     * nothing references the trace.
+     */
+    private static void injectTraceIntoReplacements(
+            Map<String, String> replacements, Map<String, String> variables,
+            List<LlmAsJudgeMessage> messages, PromptType promptType, String traceStructureJson) {
+        boolean sentinelMapped = variables.containsValue(TRACE_VARIABLE_NAME);
+        boolean templateOnly = messagesReferenceTraceDirectly(messages, variables, promptType);
+        if (!sentinelMapped && !templateOnly) {
+            return;
+        }
+        String traceJson = traceStructureJson != null ? traceStructureJson : "{}";
+        variables.forEach((name, path) -> {
+            if (TRACE_VARIABLE_NAME.equals(path)) {
+                replacements.put(name, traceJson);
+            }
+        });
+        if (templateOnly) {
+            replacements.put(TRACE_VARIABLE_NAME, traceJson);
         }
     }
 

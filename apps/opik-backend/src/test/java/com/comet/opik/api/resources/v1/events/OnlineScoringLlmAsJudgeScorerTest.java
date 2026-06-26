@@ -38,6 +38,8 @@ import dev.langchain4j.model.chat.request.ToolChoice;
 import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import io.dropwizard.util.Duration;
+import org.apache.commons.lang3.RandomStringUtils;
+import org.apache.commons.lang3.RandomUtils;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
@@ -64,6 +66,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
@@ -276,17 +279,17 @@ class OnlineScoringLlmAsJudgeScorerTest {
                 "false, true,  60000, 50000, OLLAMA,  false, false",
                 // no preconditions met
                 "false, false, 0,     50000, OPEN_AI, false, false",
-                // attachment-driven path (OPIK-6555): toggle on + provider supports tools + below size
+                // {{trace}}-driven path: toggle on + provider supports tools + below size
                 // threshold → tools fire so the judge can call get_attachment
                 "false, true,  0,     50000, OPEN_AI, true,  true",
-                // attachments but toggle off → inline (whole agentic feature is gated by the toggle)
+                // references {{trace}} but toggle off → inline (whole agentic feature is gated by the toggle)
                 "false, false, 0,     50000, OPEN_AI, true,  false",
-                // attachments but provider can't do tools → inline (internal warn, attachments unusable)
+                // references {{trace}} but provider can't do tools → inline (internal warn)
                 "false, true,  0,     50000, OLLAMA,  true,  false",
         })
         void gateMatchesTruthTable(
                 boolean hasExperimentId, boolean toggleEnabled, int estimatedTokens,
-                int thresholdTokens, LlmProvider provider, boolean hasAttachments, boolean expectedUseTools) {
+                int thresholdTokens, LlmProvider provider, boolean referencesTrace, boolean expectedUseTools) {
             String modelName = "gpt-test";
             TraceToScoreLlmAsJudge message = hasExperimentId
                     ? newMessage(UUID.randomUUID())
@@ -295,7 +298,7 @@ class OnlineScoringLlmAsJudgeScorerTest {
             lenient().when(onlineScoringConfig.getAgenticToolsThresholdTokens()).thenReturn(thresholdTokens);
             lenient().when(llmProviderFactory.getLlmProvider(modelName)).thenReturn(provider);
 
-            boolean useTools = scorer.shouldUseAgenticTools(message, estimatedTokens, modelName, hasAttachments);
+            boolean useTools = scorer.shouldUseAgenticTools(message, estimatedTokens, modelName, referencesTrace);
 
             assertThat(useTools).isEqualTo(expectedUseTools);
         }
@@ -594,6 +597,22 @@ class OnlineScoringLlmAsJudgeScorerTest {
                 }
                 """;
 
+        // Evaluator whose prompt references {{trace}} — the declarative agentic trigger. No variable
+        // binds it, so the backend's implicit detection (messagesReferenceTraceDirectly) injects the
+        // trace structure.
+        private static final String EVALUATOR_JSON_WITH_TRACE = """
+                {
+                  "model": { "name": "gpt-test", "temperature": 0.3 },
+                  "messages": [
+                    { "role": "USER", "content": "Score this trace: {{trace}}" }
+                  ],
+                  "schema": [
+                    { "name": "Quality", "type": "DOUBLE", "description": "Quality score" }
+                  ],
+                  "variables": {}
+                }
+                """;
+
         private static final String LLM_RESPONSE = """
                 {"Quality": {"score": 4.5, "reason": "good"}}
                 """;
@@ -617,25 +636,98 @@ class OnlineScoringLlmAsJudgeScorerTest {
         }
 
         @Test
-        void attachmentFetchErrorFallsBackToEmptyListAndScoringProceeds() {
-            var code = JsonUtils.readValue(EVALUATOR_JSON, LlmAsJudgeCode.class);
+        void traceVariableForcesAgenticPathAndInjectsStructureWithRealIds() {
+            var code = JsonUtils.readValue(EVALUATOR_JSON_WITH_TRACE, LlmAsJudgeCode.class);
             var message = buildScoringMessage(code);
 
+            UUID spanId = UUID.randomUUID();
+            String fileName = "input-attachment-" + RandomUtils.secure().randomInt(1, 99999999) + "-"
+                    + RandomUtils.secure().randomLong(1L, 9999999999999L) + ".jpg";
+            Span span = Span.builder()
+                    .id(spanId)
+                    .projectId(message.trace().projectId())
+                    .traceId(message.trace().id())
+                    .name("span-" + RandomStringUtils.secure().nextAlphanumeric(8))
+                    .startTime(Instant.now())
+                    .input(JsonUtils.getJsonNodeFromString("{\"messages\":\"hi\"}"))
+                    .build();
+            var attachment = com.comet.opik.api.attachment.AttachmentInfo.builder()
+                    .entityId(spanId)
+                    .entityType(com.comet.opik.api.attachment.EntityType.SPAN)
+                    .fileName(fileName)
+                    .build();
+
             when(serviceTogglesConfig.isAgenticToolsEnabled()).thenReturn(true);
+            lenient().when(onlineScoringConfig.getAgenticToolsThresholdTokens()).thenReturn(1_000_000);
             when(llmProviderFactory.getLlmProvider("gpt-test")).thenReturn(LlmProvider.OPEN_AI);
             when(llmProviderFactory.getStructuredOutputStrategy("gpt-test"))
                     .thenReturn(new ToolCallingStrategy());
-            when(spanService.getByTraceIds(any())).thenReturn(Flux.empty());
-            when(attachmentService.getAttachmentInfoByEntity(any(), any(), any()))
-                    .thenReturn(Mono.error(new RuntimeException("DB unavailable")));
-            when(aiProxyService.scoreTrace(any(), any(), any()))
+            when(spanService.getByTraceIds(any())).thenReturn(Flux.just(span));
+            when(attachmentService.getAttachmentInfoByEntityIds(
+                    eq(com.comet.opik.api.attachment.EntityType.SPAN), any()))
+                    .thenReturn(Mono.just(List.of(attachment)));
+            when(attachmentService.getAttachmentInfoByEntity(
+                    any(), eq(com.comet.opik.api.attachment.EntityType.TRACE), any()))
+                    .thenReturn(Mono.just(List.of()));
+            // Plain (no tool calls) response so handleToolCalls returns immediately.
+            ArgumentCaptor<ChatRequest> requestCaptor = ArgumentCaptor.forClass(ChatRequest.class);
+            when(aiProxyService.scoreTrace(requestCaptor.capture(), any(), any()))
                     .thenReturn(ChatResponse.builder().aiMessage(AiMessage.aiMessage(LLM_RESPONSE)).build());
             when(feedbackScoreService.scoreBatchOfTraces(any())).thenReturn(Mono.empty());
 
-            // onErrorReturn(List.of()) swallows the attachment error; scoring proceeds normally.
+            scorer.score(message).block();
+
+            // {{trace}} engaged the agentic-tools path: the scoring request carries tool specs.
+            assertThat(requestCaptor.getValue().toolSpecifications()).isNotEmpty();
+            // The injected structure carries the REAL trace id, span id and attachment file_name, so the
+            // judge can call get_attachment with correct values instead of fabricating ids.
+            String prompt = ((UserMessage) requestCaptor.getValue().messages().get(0)).singleText();
+            assertThat(prompt).contains(message.trace().id().toString());
+            assertThat(prompt).contains(spanId.toString());
+            assertThat(prompt).contains(fileName);
+        }
+
+        @Test
+        void traceVariableAttachmentFetchErrorStillScoresWithStructure() {
+            var code = JsonUtils.readValue(EVALUATOR_JSON_WITH_TRACE, LlmAsJudgeCode.class);
+            var message = buildScoringMessage(code);
+
+            UUID spanId = UUID.randomUUID();
+            Span span = Span.builder()
+                    .id(spanId)
+                    .projectId(message.trace().projectId())
+                    .traceId(message.trace().id())
+                    .name("span-" + RandomStringUtils.secure().nextAlphanumeric(8))
+                    .startTime(Instant.now())
+                    .input(JsonUtils.getJsonNodeFromString("{\"messages\":\"hi\"}"))
+                    .build();
+
+            when(serviceTogglesConfig.isAgenticToolsEnabled()).thenReturn(true);
+            lenient().when(onlineScoringConfig.getAgenticToolsThresholdTokens()).thenReturn(1_000_000);
+            when(llmProviderFactory.getLlmProvider("gpt-test")).thenReturn(LlmProvider.OPEN_AI);
+            when(llmProviderFactory.getStructuredOutputStrategy("gpt-test"))
+                    .thenReturn(new ToolCallingStrategy());
+            when(spanService.getByTraceIds(any())).thenReturn(Flux.just(span));
+            // Span-attachment listing fails — onErrorReturn(Map.of()) degrades to a structure without
+            // per-span attachments rather than blocking scoring.
+            when(attachmentService.getAttachmentInfoByEntityIds(
+                    eq(com.comet.opik.api.attachment.EntityType.SPAN), any()))
+                    .thenReturn(Mono.error(new RuntimeException("DB unavailable")));
+            when(attachmentService.getAttachmentInfoByEntity(
+                    any(), eq(com.comet.opik.api.attachment.EntityType.TRACE), any()))
+                    .thenReturn(Mono.just(List.of()));
+            ArgumentCaptor<ChatRequest> requestCaptor = ArgumentCaptor.forClass(ChatRequest.class);
+            when(aiProxyService.scoreTrace(requestCaptor.capture(), any(), any()))
+                    .thenReturn(ChatResponse.builder().aiMessage(AiMessage.aiMessage(LLM_RESPONSE)).build());
+            when(feedbackScoreService.scoreBatchOfTraces(any())).thenReturn(Mono.empty());
+
             scorer.score(message).block();
 
             verify(aiProxyService, times(1)).scoreTrace(any(), any(), any());
+            // Structure still injected (trace id + span id), just without attachment entries.
+            String prompt = ((UserMessage) requestCaptor.getValue().messages().get(0)).singleText();
+            assertThat(prompt).contains(message.trace().id().toString());
+            assertThat(prompt).contains(spanId.toString());
         }
 
         private TraceToScoreLlmAsJudge buildScoringMessage(LlmAsJudgeCode code) {

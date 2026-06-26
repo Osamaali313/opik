@@ -1206,6 +1206,58 @@ class OnlineScoringEngineTest {
     }
 
     @Test
+    @DisplayName("templateReferencesTrace detects the 'trace' sentinel and implicit {{trace}} references")
+    void templateReferencesTraceDetectsSentinelAndImplicitReference() {
+        var mustache = com.comet.opik.api.PromptType.MUSTACHE;
+        var noMessages = List.<com.comet.opik.api.evaluators.LlmAsJudgeMessage>of();
+        var traceMessage = List.of(com.comet.opik.api.evaluators.LlmAsJudgeMessage.builder()
+                .role(dev.langchain4j.data.message.ChatMessageType.USER)
+                .content("Trace: {{trace}}")
+                .build());
+
+        // Sentinel-valued variable (bare "trace") anywhere in the map.
+        assertThat(OnlineScoringEngine.templateReferencesTraceStructure(noMessages, Map.of("t", "trace"), mustache))
+                .isTrue();
+        // Implicit reference: prompt has {{trace}}, variables map doesn't bind "trace".
+        assertThat(OnlineScoringEngine.templateReferencesTraceStructure(traceMessage, Map.of(), mustache)).isTrue();
+        // Explicit override to a JSONPath wins — don't treat it as the sentinel.
+        assertThat(OnlineScoringEngine.templateReferencesTraceStructure(traceMessage,
+                Map.of("trace", "input.trace"), mustache)).isFalse();
+        // Case-sensitive, and "input.trace" is not the bare sentinel.
+        assertThat(OnlineScoringEngine.templateReferencesTraceStructure(noMessages, Map.of("x", "Trace"), mustache))
+                .isFalse();
+        assertThat(OnlineScoringEngine.templateReferencesTraceStructure(noMessages,
+                Map.of("x", "input.trace"), mustache)).isFalse();
+    }
+
+    @Test
+    @DisplayName("prepareLlmRequest substitutes a {{trace}}-referencing variable with the supplied structure JSON")
+    void prepareLlmRequestInjectsTraceStructure() {
+        var evaluatorCode = LlmAsJudgeCode.builder()
+                .model(com.comet.opik.api.evaluators.LlmAsJudgeModelParameters.builder()
+                        .name("gpt-4o").temperature(0.3).build())
+                .messages(List.of(
+                        com.comet.opik.api.evaluators.LlmAsJudgeMessage.builder()
+                                .role(dev.langchain4j.data.message.ChatMessageType.USER)
+                                .content("Inspect: {{trace}}")
+                                .build()))
+                .variables(new java.util.LinkedHashMap<>(Map.of("trace", "trace")))
+                .schema(List.of())
+                .build();
+        var trace = createTrace(generator.generate(), generator.generate());
+        var traceId = "trace-" + RandomStringUtils.secure().nextAlphanumeric(12);
+        var structure = "{\"trace_id\":\"%s\",\"span_tree\":[]}".formatted(traceId);
+
+        var request = OnlineScoringEngine.prepareLlmRequest(evaluatorCode, trace, new InstructionStrategy(),
+                com.comet.opik.api.PromptType.MUSTACHE, List.of(), structure);
+
+        var allText = request.messages().stream().map(Object::toString).collect(Collectors.joining("\n"));
+        assertThat(allText).contains(traceId);
+        // Sentinel literal must not leak into the rendered prompt.
+        assertThat(allText).doesNotContain("{{trace}}");
+    }
+
+    @Test
     @DisplayName("prepareLlmRequest substitutes {{spans}}-referencing variables with the serialized spans list")
     void prepareLlmRequestInjectsSpansFromSentinelVariable() {
         var evaluatorCode = LlmAsJudgeCode.builder()

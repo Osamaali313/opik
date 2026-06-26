@@ -59,6 +59,22 @@ export const RESERVED_TRACE_EVALUATOR_VARIABLES: Readonly<
   spans: "spans",
 });
 
+/**
+ * LLM-as-judge trace-scope reserved variables. Superset of
+ * {@link RESERVED_TRACE_EVALUATOR_VARIABLES}: adds `{{trace}}`, which injects the
+ * trace skeleton (trace id, span ids, attachment file_names) into the prompt and
+ * triggers the agentic-tools loop so the judge can call `get_attachment` with real
+ * ids. `trace` is intentionally NOT in the shared set above — the Python-metric
+ * backend only handles `spans`, so auto-mapping a `trace` param there would inject a
+ * value the scorer ignores.
+ */
+export const RESERVED_TRACE_LLM_JUDGE_VARIABLES: Readonly<
+  Record<string, string>
+> = Object.freeze({
+  spans: "spans",
+  trace: "trace",
+});
+
 export const DEFAULT_OPEN_AI_CONFIGS = {
   TEMPERATURE: 0,
   MAX_COMPLETION_TOKENS: 4000,
