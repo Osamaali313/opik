@@ -636,11 +636,13 @@ class OnlineScoringLlmAsJudgeScorerTest {
         }
 
         @Test
-        void traceVariableForcesAgenticPathAndInjectsStructureWithRealIds() {
+        void traceVariableInjectsStructureWithTraceLevelAttachments() {
             var code = JsonUtils.readValue(EVALUATOR_JSON_WITH_TRACE, LlmAsJudgeCode.class);
             var message = buildScoringMessage(code);
 
             UUID spanId = UUID.randomUUID();
+            // Trace-level eval lists only the TRACE's own attachments — the judge fetches them with
+            // get_attachment(type=trace, id=<trace_id>, file_name=...). Span-level attachments are excluded.
             String fileName = "input-attachment-" + RandomUtils.secure().randomInt(1, 99999999) + "-"
                     + RandomUtils.secure().randomLong(1L, 9999999999999L) + ".jpg";
             Span span = Span.builder()
@@ -651,9 +653,9 @@ class OnlineScoringLlmAsJudgeScorerTest {
                     .startTime(Instant.now())
                     .input(JsonUtils.getJsonNodeFromString("{\"messages\":\"hi\"}"))
                     .build();
-            var attachment = com.comet.opik.api.attachment.AttachmentInfo.builder()
-                    .entityId(spanId)
-                    .entityType(com.comet.opik.api.attachment.EntityType.SPAN)
+            var traceAttachment = com.comet.opik.api.attachment.AttachmentInfo.builder()
+                    .entityId(message.trace().id())
+                    .entityType(com.comet.opik.api.attachment.EntityType.TRACE)
                     .fileName(fileName)
                     .build();
 
@@ -663,12 +665,9 @@ class OnlineScoringLlmAsJudgeScorerTest {
             when(llmProviderFactory.getStructuredOutputStrategy("gpt-test"))
                     .thenReturn(new ToolCallingStrategy());
             when(spanService.getByTraceIds(any())).thenReturn(Flux.just(span));
-            when(attachmentService.getAttachmentInfoByEntityIds(
-                    eq(com.comet.opik.api.attachment.EntityType.SPAN), any()))
-                    .thenReturn(Mono.just(List.of(attachment)));
             when(attachmentService.getAttachmentInfoByEntity(
                     any(), eq(com.comet.opik.api.attachment.EntityType.TRACE), any()))
-                    .thenReturn(Mono.just(List.of()));
+                    .thenReturn(Mono.just(List.of(traceAttachment)));
             // Plain (no tool calls) response so handleToolCalls returns immediately.
             ArgumentCaptor<ChatRequest> requestCaptor = ArgumentCaptor.forClass(ChatRequest.class);
             when(aiProxyService.scoreTrace(requestCaptor.capture(), any(), any()))
@@ -679,8 +678,8 @@ class OnlineScoringLlmAsJudgeScorerTest {
 
             // {{trace}} engaged the agentic-tools path: the scoring request carries tool specs.
             assertThat(requestCaptor.getValue().toolSpecifications()).isNotEmpty();
-            // The injected structure carries the REAL trace id, span id and attachment file_name, so the
-            // judge can call get_attachment with correct values instead of fabricating ids.
+            // The injected structure carries the REAL trace id, span ids, and the trace-level attachment
+            // file_name, so the judge can call get_attachment with correct values instead of guessing.
             String prompt = ((UserMessage) requestCaptor.getValue().messages().get(0)).singleText();
             assertThat(prompt).contains(message.trace().id().toString());
             assertThat(prompt).contains(spanId.toString());
@@ -708,14 +707,11 @@ class OnlineScoringLlmAsJudgeScorerTest {
             when(llmProviderFactory.getStructuredOutputStrategy("gpt-test"))
                     .thenReturn(new ToolCallingStrategy());
             when(spanService.getByTraceIds(any())).thenReturn(Flux.just(span));
-            // Span-attachment listing fails — onErrorReturn(Map.of()) degrades to a structure without
-            // per-span attachments rather than blocking scoring.
-            when(attachmentService.getAttachmentInfoByEntityIds(
-                    eq(com.comet.opik.api.attachment.EntityType.SPAN), any()))
-                    .thenReturn(Mono.error(new RuntimeException("DB unavailable")));
+            // Trace-attachment listing fails — onErrorReturn(List.of()) degrades to a structure without
+            // attachment entries rather than blocking scoring.
             when(attachmentService.getAttachmentInfoByEntity(
                     any(), eq(com.comet.opik.api.attachment.EntityType.TRACE), any()))
-                    .thenReturn(Mono.just(List.of()));
+                    .thenReturn(Mono.error(new RuntimeException("DB unavailable")));
             ArgumentCaptor<ChatRequest> requestCaptor = ArgumentCaptor.forClass(ChatRequest.class);
             when(aiProxyService.scoreTrace(requestCaptor.capture(), any(), any()))
                     .thenReturn(ChatResponse.builder().aiMessage(AiMessage.aiMessage(LLM_RESPONSE)).build());

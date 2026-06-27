@@ -2,7 +2,6 @@ package com.comet.opik.api.resources.v1.events;
 
 import com.comet.opik.api.Span;
 import com.comet.opik.api.Trace;
-import com.comet.opik.api.attachment.AttachmentInfo;
 import com.comet.opik.api.events.TraceToScoreLlmAsJudge;
 import com.comet.opik.api.resources.v1.events.tools.CompressionTier;
 import com.comet.opik.api.resources.v1.events.tools.EntityRef;
@@ -47,11 +46,9 @@ import ru.vyarus.dropwizard.guice.module.yaml.bind.Config;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 import static com.comet.opik.api.FeedbackScoreItem.FeedbackScoreBatchItem;
 import static com.comet.opik.api.evaluators.AutomationRuleEvaluatorType.Constants;
@@ -215,44 +212,30 @@ public class OnlineScoringLlmAsJudgeScorer extends OnlineScoringBaseScorer<Trace
     /**
      * Builds the {@code {{trace}}} structure injected into the prompt: the trace+spans content
      * (compressed via {@link TraceCompressor#compress} — the same path the {@code read} tool uses)
-     * enriched with per-span and trace-level attachment {@code file_name}s, wrapped in a small id
-     * envelope ({@code trace_id} + {@code tier} + {@code data}) so the judge has the real trace id
-     * inline and can call {@code get_attachment} / {@code read} with correct values. This method
-     * only fetches the attachment metadata — which isn't carried on the {@link Span} objects — via
-     * one batched span-level query plus the trace-level lookup, both best-effort (a listing failure
-     * degrades to no attachments rather than blocking scoring).
+     * enriched with the <strong>trace-level</strong> attachment {@code file_name}s, wrapped in a small
+     * id envelope ({@code trace_id} + {@code tier} + {@code data}) so the judge has the real trace id
+     * inline and can call {@code get_attachment(type=trace, id=<trace_id>, file_name=...)} with correct
+     * values.
+     *
+     * <p>A trace-level online eval scores only the trace's own attachments, so this lists just the
+     * trace-level attachment metadata (which isn't carried on the {@link Trace} object) via a single
+     * best-effort lookup — a listing failure degrades to no attachments rather than blocking scoring.
+     * Span-level attachments are intentionally excluded here; surfacing and scoring those belongs to
+     * span-level evals.
      */
     private Mono<String> buildTraceStructure(Trace trace, List<Span> spans, TraceToScoreLlmAsJudge message) {
-        Set<UUID> spanIds = spans.stream()
-                .map(Span::id)
-                .filter(Objects::nonNull)
-                .collect(Collectors.toSet());
-
-        Mono<Map<UUID, List<AttachmentInfo>>> spanAttachmentsMono = spanIds.isEmpty()
-                ? Mono.just(Map.of())
-                : attachmentService
-                        .getAttachmentInfoByEntityIds(com.comet.opik.api.attachment.EntityType.SPAN, spanIds)
-                        .map(attachments -> attachments.stream()
-                                .filter(a -> a.entityId() != null)
-                                .collect(Collectors.groupingBy(AttachmentInfo::entityId)))
-                        .onErrorReturn(Map.of())
-                        .contextWrite(ctx -> ctx
-                                .put(RequestContext.WORKSPACE_ID, message.workspaceId())
-                                .put(RequestContext.USER_NAME, message.userName()));
-
-        Mono<List<AttachmentInfo>> traceAttachmentsMono = attachmentService
+        return attachmentService
                 .getAttachmentInfoByEntity(trace.id(), com.comet.opik.api.attachment.EntityType.TRACE,
                         trace.projectId())
                 .onErrorReturn(List.of())
                 .contextWrite(ctx -> ctx
                         .put(RequestContext.WORKSPACE_ID, message.workspaceId())
-                        .put(RequestContext.USER_NAME, message.userName()));
-
-        return Mono.zip(spanAttachmentsMono, traceAttachmentsMono)
-                .map(tuple -> {
+                        .put(RequestContext.USER_NAME, message.userName()))
+                .map(traceAttachments -> {
                     JsonNode fullJson = traceCompressor.buildFullJson(trace, spans);
+                    // No span attachments on a trace-level eval — only the trace's own attachments are listed.
                     var compressed = traceCompressor.compress(fullJson, trace, spans, CompressionTier.FULL,
-                            tuple.getT1(), tuple.getT2());
+                            Map.of(), traceAttachments);
                     // compress() is id-agnostic; add the id envelope on top here, mirroring ReadTool.
                     ObjectNode envelope = JsonUtils.getMapper().createObjectNode();
                     envelope.put("trace_id", trace.id() != null ? trace.id().toString() : null);
