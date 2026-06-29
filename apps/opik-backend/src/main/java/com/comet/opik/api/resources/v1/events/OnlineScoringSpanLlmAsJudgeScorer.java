@@ -186,7 +186,8 @@ public class OnlineScoringSpanLlmAsJudgeScorer extends OnlineScoringBaseScorer<S
                 .contextWrite(ctx -> ctx
                         .put(RequestContext.WORKSPACE_ID, message.workspaceId())
                         .put(RequestContext.USER_NAME, message.userName()));
-        return listAttachmentsToleratingUploadRace(fetch, span.input(), span.output(), span.metadata());
+        return listAttachmentsToleratingUploadRace(fetch, message.workspaceId(), span.id(),
+                span.input(), span.output(), span.metadata());
     }
 
     private Mono<List<FeedbackScoreBatchItem>> evaluate(SpanToScoreLlmAsJudge message,

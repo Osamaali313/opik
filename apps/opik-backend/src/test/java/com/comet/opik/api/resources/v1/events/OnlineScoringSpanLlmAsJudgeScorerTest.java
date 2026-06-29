@@ -275,8 +275,8 @@ class OnlineScoringSpanLlmAsJudgeScorerTest {
                 .fileName("input-attachment-86584937-1782581642686-sdk.jpg").build();
         var body = JsonUtils.getJsonNodeFromString("{\"q\":\"see [input-attachment-1-1782581642301.jpg]\"}");
 
-        var result = OnlineScoringBaseScorer.listAttachmentsToleratingUploadRace(
-                Mono.just(List.of(transientAttachment, persistentAttachment)), body).block();
+        var result = scorer.listAttachmentsToleratingUploadRace(
+                Mono.just(List.of(transientAttachment, persistentAttachment)), "ws-1", id, body).block();
 
         assertThat(result).extracting(a -> a.fileName())
                 .containsExactly("input-attachment-86584937-1782581642686-sdk.jpg");
@@ -290,8 +290,8 @@ class OnlineScoringSpanLlmAsJudgeScorerTest {
                 .entityId(UUID.randomUUID()).entityType(com.comet.opik.api.attachment.EntityType.SPAN)
                 .fileName("input-attachment-1-1782581642301.jpg").build();
 
-        var result = OnlineScoringBaseScorer.listAttachmentsToleratingUploadRace(Mono.just(List.of(auto)))
-                .block();
+        var result = scorer.listAttachmentsToleratingUploadRace(
+                Mono.just(List.of(auto)), "ws-1", UUID.randomUUID()).block();
 
         assertThat(result).extracting(a -> a.fileName()).containsExactly("input-attachment-1-1782581642301.jpg");
     }
@@ -306,8 +306,8 @@ class OnlineScoringSpanLlmAsJudgeScorerTest {
                 .fileName("input-attachment-1-1782581642301.jpg").build();
         var body = JsonUtils.getJsonNodeFromString("{\"q\":\"see [input-attachment-1-1782581642301.jpg]\"}");
 
-        var result = OnlineScoringBaseScorer.listAttachmentsToleratingUploadRace(
-                Mono.just(List.of(auto)), body).block();
+        var result = scorer.listAttachmentsToleratingUploadRace(
+                Mono.just(List.of(auto)), "ws-1", UUID.randomUUID(), body).block();
 
         assertThat(result).extracting(a -> a.fileName()).containsExactly("input-attachment-1-1782581642301.jpg");
     }

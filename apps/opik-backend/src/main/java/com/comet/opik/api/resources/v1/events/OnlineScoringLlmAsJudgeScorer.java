@@ -232,7 +232,8 @@ public class OnlineScoringLlmAsJudgeScorer extends OnlineScoringBaseScorer<Trace
                         .put(RequestContext.USER_NAME, message.userName()));
         // Tolerate the attachment-upload race (a trace's attachment may not be uploaded yet when scoring
         // reads the table), gated on the trace body actually referencing an attachment.
-        return listAttachmentsToleratingUploadRace(fetch, trace.input(), trace.output(), trace.metadata())
+        return listAttachmentsToleratingUploadRace(fetch, message.workspaceId(), trace.id(),
+                trace.input(), trace.output(), trace.metadata())
                 .map(traceAttachments -> {
                     JsonNode fullJson = traceCompressor.buildFullJson(trace, spans);
                     // Only the trace's own attachments are listed on a trace-level eval.

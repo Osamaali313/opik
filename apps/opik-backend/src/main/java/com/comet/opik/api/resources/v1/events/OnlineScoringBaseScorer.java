@@ -153,23 +153,39 @@ public abstract class OnlineScoringBaseScorer<M extends WorkspaceScopedMessage> 
      * (the common case). If the retry budget is exhausted — e.g. a REST-ingested image whose only copy is
      * auto-stripped and never replaced — it falls back to a best-effort final read rather than dropping it.
      *
-     * @param coldFetch the attachment lookup — must be cold (re-runs the query on each subscription)
-     * @param bodyNodes the entity's content nodes scanned for attachment references
+     * <p>A genuine lookup failure is logged once (with the workspace/entity identifiers and the stack
+     * trace) before degrading to an empty list, so the best-effort behavior is still operator-visible.
+     * The benign retry-exhaustion path (no persistent copy ever appears) completes empty rather than in
+     * error, so it is <em>not</em> logged as a failure.
+     *
+     * @param coldFetch   the attachment lookup — must be cold (re-runs the query on each subscription)
+     * @param workspaceId workspace id, included in the failure log for observability
+     * @param entityId    the trace/span id whose attachments are being listed, included in the failure log
+     * @param bodyNodes   the entity's content nodes scanned for attachment references
      */
-    protected static Mono<List<AttachmentInfo>> listAttachmentsToleratingUploadRace(
-            @NonNull Mono<List<AttachmentInfo>> coldFetch, JsonNode... bodyNodes) {
+    protected Mono<List<AttachmentInfo>> listAttachmentsToleratingUploadRace(
+            @NonNull Mono<List<AttachmentInfo>> coldFetch, String workspaceId, UUID entityId,
+            JsonNode... bodyNodes) {
+        // Attach the failure log to the cold fetch itself so it fires only on a real lookup error — not
+        // on the empty-completion-driven retries or the benign retry-exhaustion path below.
+        Mono<List<AttachmentInfo>> fetch = coldFetch.doOnError(error -> log.warn(
+                "Failed to list attachments for workspace '{}', entity '{}'; degrading to best-effort"
+                        + " attachment discovery (online scoring will proceed without them)",
+                workspaceId, entityId, error));
+
         boolean expectsAttachment = AttachmentUtils.hasAttachmentReferences(JsonUtils.getMapper(), bodyNodes);
         if (!expectsAttachment) {
-            return coldFetch.map(OnlineScoringBaseScorer::preferPersistentAttachments).onErrorReturn(List.of());
+            return fetch.map(OnlineScoringBaseScorer::preferPersistentAttachments).onErrorReturn(List.of());
         }
-        return coldFetch
+        return fetch
                 .map(OnlineScoringBaseScorer::preferPersistentAttachments)
                 .filter(OnlineScoringBaseScorer::hasPersistentAttachment)
                 .repeatWhenEmpty(ATTACHMENT_FETCH_MAX_RETRIES,
                         repeats -> repeats.delayElements(ATTACHMENT_FETCH_RETRY_DELAY))
                 .onErrorResume(error -> Mono.empty())
                 // Retries exhausted (no persistent copy will come): best-effort final read so a
-                // backend-/REST-only auto-stripped attachment is still surfaced rather than dropped.
+                // backend-/REST-only auto-stripped attachment is still surfaced rather than dropped. Uses
+                // the raw coldFetch — any failure on the primary attempt above was already logged.
                 .switchIfEmpty(Mono.defer(() -> coldFetch
                         .map(OnlineScoringBaseScorer::preferPersistentAttachments)
                         .onErrorReturn(List.of())));
