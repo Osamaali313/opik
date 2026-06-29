@@ -2347,6 +2347,108 @@ class OnlineScoringEngineTest {
         assertThat(userMessage.singleText()).contains("Literal: some literal value");
     }
 
+    @Test
+    @DisplayName("templateReferencesSpanStructure detects the 'span' sentinel and implicit {{span}} references")
+    void templateReferencesSpanStructureDetectsSentinelAndImplicitReference() {
+        var mustache = com.comet.opik.api.PromptType.MUSTACHE;
+        var noMessages = List.<com.comet.opik.api.evaluators.LlmAsJudgeMessage>of();
+        var spanMessage = List.of(com.comet.opik.api.evaluators.LlmAsJudgeMessage.builder()
+                .role(dev.langchain4j.data.message.ChatMessageType.USER)
+                .content("Span: {{span}}")
+                .build());
+
+        // Sentinel-valued variable (bare "span") anywhere in the map.
+        assertThat(OnlineScoringEngine.templateReferencesSpanStructure(noMessages, Map.of("s", "span"), mustache))
+                .isTrue();
+        // Implicit reference: prompt has {{span}}, variables map doesn't bind "span".
+        assertThat(OnlineScoringEngine.templateReferencesSpanStructure(spanMessage, Map.of(), mustache)).isTrue();
+        // Explicit override to a JSONPath wins — don't treat it as the sentinel.
+        assertThat(OnlineScoringEngine.templateReferencesSpanStructure(spanMessage,
+                Map.of("span", "input.span"), mustache)).isFalse();
+        // Case-sensitive, and "input.span" / the plural "spans" are not the bare "span" sentinel.
+        assertThat(OnlineScoringEngine.templateReferencesSpanStructure(noMessages, Map.of("x", "Span"), mustache))
+                .isFalse();
+        assertThat(OnlineScoringEngine.templateReferencesSpanStructure(noMessages, Map.of("x", "spans"), mustache))
+                .isFalse();
+    }
+
+    @Test
+    @DisplayName("prepareSpanLlmRequest (tool-mode) substitutes a {{span}}-referencing variable with the structure JSON")
+    void prepareSpanLlmRequestInjectsSpanStructure() {
+        var evaluatorCode = AutomationRuleEvaluatorSpanLlmAsJudge.SpanLlmAsJudgeCode.builder()
+                .model(com.comet.opik.api.evaluators.LlmAsJudgeModelParameters.builder()
+                        .name("gpt-4o").temperature(0.3).build())
+                .messages(List.of(
+                        com.comet.opik.api.evaluators.LlmAsJudgeMessage.builder()
+                                .role(dev.langchain4j.data.message.ChatMessageType.USER)
+                                .content("Inspect: {{span}}")
+                                .build()))
+                .variables(new java.util.LinkedHashMap<>(Map.of("span", "span")))
+                .schema(List.of())
+                .build();
+        var span = createSpan(generator.generate(), generator.generate());
+        var spanRef = "span-" + RandomStringUtils.secure().nextAlphanumeric(12);
+        var structure = "{\"span_id\":\"%s\",\"attachments\":[]}".formatted(spanRef);
+
+        var request = OnlineScoringEngine.prepareSpanLlmRequest(evaluatorCode, span, new InstructionStrategy(),
+                4_000, "drill hint", structure);
+
+        var allText = request.messages().stream().map(Object::toString).collect(Collectors.joining("\n"));
+        assertThat(allText).contains(spanRef);
+        // Sentinel literal must not leak into the rendered prompt.
+        assertThat(allText).doesNotContain("{{span}}");
+    }
+
+    @Test
+    @DisplayName("prepareSpanLlmRequest (inline) injects the {{span}} structure without capping")
+    void prepareSpanLlmRequestInlineInjectsSpanStructure() {
+        var evaluatorCode = AutomationRuleEvaluatorSpanLlmAsJudge.SpanLlmAsJudgeCode.builder()
+                .model(com.comet.opik.api.evaluators.LlmAsJudgeModelParameters.builder()
+                        .name("gpt-4o").temperature(0.3).build())
+                .messages(List.of(
+                        com.comet.opik.api.evaluators.LlmAsJudgeMessage.builder()
+                                .role(dev.langchain4j.data.message.ChatMessageType.USER)
+                                .content("Inspect: {{span}}")
+                                .build()))
+                .variables(new java.util.LinkedHashMap<>(Map.of("span", "span")))
+                .schema(List.of())
+                .build();
+        var span = createSpan(generator.generate(), generator.generate());
+        var spanRef = "span-" + RandomStringUtils.secure().nextAlphanumeric(12);
+        var structure = "{\"span_id\":\"%s\",\"attachments\":[]}".formatted(spanRef);
+
+        var request = OnlineScoringEngine.prepareSpanLlmRequest(evaluatorCode, span,
+                new InstructionStrategy(), structure);
+
+        var allText = request.messages().stream().map(Object::toString).collect(Collectors.joining("\n"));
+        assertThat(allText).contains(spanRef);
+        assertThat(allText).doesNotContain("{{span}}");
+    }
+
+    @Test
+    @DisplayName("prepareSpanLlmRequest renders {{span}} as {} when no structure is supplied, not the literal sentinel")
+    void prepareSpanLlmRequestRendersEmptyStructureWhenNull() {
+        var evaluatorCode = AutomationRuleEvaluatorSpanLlmAsJudge.SpanLlmAsJudgeCode.builder()
+                .model(com.comet.opik.api.evaluators.LlmAsJudgeModelParameters.builder()
+                        .name("gpt-4o").temperature(0.3).build())
+                .messages(List.of(
+                        com.comet.opik.api.evaluators.LlmAsJudgeMessage.builder()
+                                .role(dev.langchain4j.data.message.ChatMessageType.USER)
+                                .content("Inspect: {{span}}")
+                                .build()))
+                .variables(new java.util.LinkedHashMap<>(Map.of("span", "span")))
+                .schema(List.of())
+                .build();
+        var span = createSpan(generator.generate(), generator.generate());
+
+        var request = OnlineScoringEngine.prepareSpanLlmRequest(evaluatorCode, span,
+                new InstructionStrategy(), null);
+
+        var allText = request.messages().stream().map(Object::toString).collect(Collectors.joining("\n"));
+        assertThat(allText).contains("Inspect: {}");
+        assertThat(allText).doesNotContain("{{span}}");
+    }
+
     private Span createSpan(UUID spanId, UUID projectId) {
         return Span.builder()
                 .id(spanId)

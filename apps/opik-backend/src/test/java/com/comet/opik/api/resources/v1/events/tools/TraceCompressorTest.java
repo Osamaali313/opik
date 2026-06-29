@@ -14,7 +14,6 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -121,16 +120,9 @@ class TraceCompressorTest {
     }
 
     @Test
-    void skeletonTierCarriesSpanAndTraceAttachmentsWhenSupplied() {
+    void skeletonTierCarriesTraceAttachmentsWhenSupplied() {
         var span = span("span-" + RandomStringUtils.secure().nextAlphanumeric(8), null);
         var trace = trace("trace-" + RandomStringUtils.secure().nextAlphanumeric(8));
-        var fileName = "input-attachment-" + RandomUtils.secure().randomInt(1, 99999999) + "-"
-                + RandomUtils.secure().randomLong(1L, 9999999999999L) + ".jpg";
-        var spanAttachment = AttachmentInfo.builder()
-                .entityId(span.id())
-                .entityType(com.comet.opik.api.attachment.EntityType.SPAN)
-                .fileName(fileName)
-                .build();
         var traceFileName = "trace-doc-" + RandomUtils.secure().randomInt(1, 99999999) + ".pdf";
         var traceAttachment = AttachmentInfo.builder()
                 .entityId(trace.id())
@@ -140,38 +132,34 @@ class TraceCompressorTest {
         var full = compressor.buildFullJson(trace, List.of(span));
 
         var result = compressor.compress(full, trace, List.of(span), CompressionTier.SKELETON,
-                Map.of(span.id(), List.of(spanAttachment)), List.of(traceAttachment));
+                List.of(traceAttachment));
 
-        var payload = result.payload();
-        // Per-span attachment file_name surfaces on the matching span_tree node.
-        assertThat(payload.get("span_tree").get(0).get("attachments").get(0).get("file_name").asText())
-                .isEqualTo(fileName);
-        // Trace-level attachment surfaces at the top of the skeleton.
-        assertThat(payload.get("attachments").get(0).get("file_name").asText()).isEqualTo(traceFileName);
+        // Trace-level attachment surfaces at the top of the skeleton; spans carry no attachments.
+        assertThat(result.payload().get("attachments").get(0).get("file_name").asText()).isEqualTo(traceFileName);
+        assertThat(result.payload().get("span_tree").get(0).has("attachments")).isFalse();
     }
 
     @Test
-    void fullTierEnrichesCompositeSpansAndTraceWithAttachments() {
+    void fullTierEnrichesCompositeTraceWithAttachments() {
         var span = span("span-" + RandomStringUtils.secure().nextAlphanumeric(8), null);
         var trace = trace("trace-" + RandomStringUtils.secure().nextAlphanumeric(8));
-        var fileName = "input-attachment-" + RandomUtils.secure().randomInt(1, 99999999) + ".jpg";
-        var spanAttachment = AttachmentInfo.builder()
-                .entityId(span.id())
-                .entityType(com.comet.opik.api.attachment.EntityType.SPAN)
-                .fileName(fileName)
+        var traceFileName = "trace-doc-" + RandomUtils.secure().randomInt(1, 99999999) + ".pdf";
+        var traceAttachment = AttachmentInfo.builder()
+                .entityId(trace.id())
+                .entityType(com.comet.opik.api.attachment.EntityType.TRACE)
+                .fileName(traceFileName)
                 .build();
         var full = compressor.buildFullJson(trace, List.of(span));
 
         var result = compressor.compress(full, trace, List.of(span), CompressionTier.FULL,
-                Map.of(span.id(), List.of(spanAttachment)), List.of());
+                List.of(traceAttachment));
 
         assertThat(result.tier()).isEqualTo(CompressionTier.FULL);
-        // FULL keeps the {trace, spans} composite shape; the matching span gains an attachments array.
-        var spanNode = result.payload().get("spans").get(0);
-        assertThat(spanNode.get("id").asText()).isEqualTo(span.id().toString());
-        assertThat(spanNode.get("attachments").get(0).get("file_name").asText()).isEqualTo(fileName);
+        // FULL keeps the {trace, spans} composite shape; the trace node gains an attachments array.
+        assertThat(result.payload().get("trace").get("attachments").get(0).get("file_name").asText())
+                .isEqualTo(traceFileName);
         // The cached fullJson is left untouched (enrichment works on a copy).
-        assertThat(full.get("spans").get(0).has("attachments")).isFalse();
+        assertThat(full.get("trace").has("attachments")).isFalse();
     }
 
     private static Trace trace(String name) {

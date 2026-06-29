@@ -75,6 +75,19 @@ export const RESERVED_TRACE_LLM_JUDGE_VARIABLES: Readonly<
   trace: "trace",
 });
 
+/**
+ * LLM-as-judge span-scope reserved variables: `{{span}}` injects the span (span id +
+ * the span's own attachment file_names) into the prompt and triggers the agentic-tools
+ * loop so the span judge can call `get_attachment(type=span, ...)` with real ids. The
+ * span-scope analogue of `{{trace}}`; `{{spans}}` / `{{trace}}` are not meaningful at
+ * span scope (a span has no sub-spans, and the trace structure belongs to trace scope).
+ */
+export const RESERVED_SPAN_LLM_JUDGE_VARIABLES: Readonly<
+  Record<string, string>
+> = Object.freeze({
+  span: "span",
+});
+
 export const DEFAULT_OPEN_AI_CONFIGS = {
   TEMPERATURE: 0,
   MAX_COMPLETION_TOKENS: 4000,

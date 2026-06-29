@@ -61,6 +61,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -724,6 +725,55 @@ class OnlineScoringLlmAsJudgeScorerTest {
             String prompt = ((UserMessage) requestCaptor.getValue().messages().get(0)).singleText();
             assertThat(prompt).contains(message.trace().id().toString());
             assertThat(prompt).contains(spanId.toString());
+        }
+
+        @Test
+        void traceAttachmentUploadRaceRetriesUntilPersistentCopyAppears() {
+            var code = JsonUtils.readValue(EVALUATOR_JSON_WITH_TRACE, LlmAsJudgeCode.class);
+            // Trace body references the attachment, so the scorer retries the listing until the persistent
+            // (-sdk) copy lands instead of giving up on the first empty result.
+            String fileName = "input-attachment-86584937-1782579409975-sdk.jpg";
+            Trace trace = Trace.builder()
+                    .id(UUID.randomUUID())
+                    .projectId(UUID.randomUUID())
+                    .name(UUID.randomUUID().toString())
+                    .startTime(Instant.now())
+                    .input(JsonUtils.getJsonNodeFromString("{\"q\":\"see [" + fileName + "]\"}"))
+                    .build();
+            var message = new TraceToScoreLlmAsJudge(
+                    trace, UUID.randomUUID(), UUID.randomUUID().toString(), code,
+                    UUID.randomUUID().toString(), UUID.randomUUID().toString(), null, Map.of(),
+                    PromptType.MUSTACHE, null, null);
+            var traceAttachment = com.comet.opik.api.attachment.AttachmentInfo.builder()
+                    .entityId(trace.id())
+                    .entityType(com.comet.opik.api.attachment.EntityType.TRACE)
+                    .fileName(fileName)
+                    .build();
+
+            when(serviceTogglesConfig.isAgenticToolsEnabled()).thenReturn(true);
+            lenient().when(onlineScoringConfig.getAgenticToolsThresholdTokens()).thenReturn(1_000_000);
+            when(llmProviderFactory.getLlmProvider("gpt-test")).thenReturn(LlmProvider.OPEN_AI);
+            when(llmProviderFactory.getStructuredOutputStrategy("gpt-test"))
+                    .thenReturn(new ToolCallingStrategy());
+            when(spanService.getByTraceIds(any())).thenReturn(Flux.empty());
+            // Cold lookup: first subscription sees the not-yet-uploaded state (empty), the retry sees it land.
+            AtomicInteger subscriptions = new AtomicInteger();
+            when(attachmentService.getAttachmentInfoByEntity(
+                    any(), eq(com.comet.opik.api.attachment.EntityType.TRACE), any()))
+                    .thenReturn(Mono.defer(() -> Mono.just(subscriptions.getAndIncrement() == 0
+                            ? List.<com.comet.opik.api.attachment.AttachmentInfo>of()
+                            : List.of(traceAttachment))));
+            ArgumentCaptor<ChatRequest> requestCaptor = ArgumentCaptor.forClass(ChatRequest.class);
+            when(aiProxyService.scoreTrace(requestCaptor.capture(), any(), any()))
+                    .thenReturn(ChatResponse.builder().aiMessage(AiMessage.aiMessage(LLM_RESPONSE)).build());
+            when(feedbackScoreService.scoreBatchOfTraces(any())).thenReturn(Mono.empty());
+
+            scorer.score(message).block();
+
+            // First listing was empty (upload not landed); the retry resubscribed and picked up the attachment.
+            assertThat(subscriptions.get()).isGreaterThanOrEqualTo(2);
+            String prompt = ((UserMessage) requestCaptor.getValue().messages().get(0)).singleText();
+            assertThat(prompt).contains(fileName);
         }
 
         private TraceToScoreLlmAsJudge buildScoringMessage(LlmAsJudgeCode code) {

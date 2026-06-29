@@ -2,6 +2,7 @@ package com.comet.opik.api.resources.v1.events;
 
 import com.comet.opik.api.FeedbackScoreItem;
 import com.comet.opik.api.Trace;
+import com.comet.opik.api.attachment.AttachmentInfo;
 import com.comet.opik.api.evaluators.AutomationRuleEvaluatorType;
 import com.comet.opik.api.events.WorkspaceScopedMessage;
 import com.comet.opik.api.filter.Operator;
@@ -11,9 +12,12 @@ import com.comet.opik.api.resources.v1.events.tools.TraceToolContext;
 import com.comet.opik.domain.FeedbackScoreService;
 import com.comet.opik.domain.TraceSearchCriteria;
 import com.comet.opik.domain.TraceService;
+import com.comet.opik.domain.attachment.AttachmentUtils;
 import com.comet.opik.infrastructure.OnlineScoringConfig;
 import com.comet.opik.infrastructure.OnlineScoringStreamConfigurationAdapter;
 import com.comet.opik.infrastructure.auth.RequestContext;
+import com.comet.opik.utils.JsonUtils;
+import com.fasterxml.jackson.databind.JsonNode;
 import io.opentelemetry.api.GlobalOpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
@@ -29,6 +33,7 @@ import reactor.core.publisher.Mono;
 import ru.vyarus.dropwizard.guice.module.yaml.bind.Config;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -50,6 +55,19 @@ import static com.comet.opik.infrastructure.log.LogContextAware.wrapWithMdc;
 public abstract class OnlineScoringBaseScorer<M extends WorkspaceScopedMessage> extends BaseRedisSubscriber<M> {
 
     public static final int TRACE_PAGE_LIMIT = 2000;
+
+    /**
+     * Attachment-upload race tolerance for the {@code {{trace}}} / {@code {{span}}} structures. The SDK
+     * uploads an entity's attachment a short moment <em>after</em> the entity itself is ingested, so a
+     * scoring run triggered immediately can read the attachment table before the persistent copy lands.
+     * When the entity body references an attachment but the listing is still empty, the cold lookup is
+     * resubscribed up to {@link #ATTACHMENT_FETCH_MAX_RETRIES} times spaced by
+     * {@link #ATTACHMENT_FETCH_RETRY_DELAY} so the upload can complete (~0.3–1.5 s worst case, and only
+     * for entities that actually expect an attachment). See {@link #listAttachmentsToleratingUploadRace}.
+     */
+    private static final int ATTACHMENT_FETCH_MAX_RETRIES = 5;
+    private static final Duration ATTACHMENT_FETCH_RETRY_DELAY = Duration.ofMillis(300);
+
     private static final String ONLINE_SCORING_NAMESPACE = "online_scoring";
     private static final AttributeKey<String> WORKSPACE_ID_KEY = AttributeKey.stringKey("workspace_id");
     private static final AttributeKey<String> WORKSPACE_NAME_KEY = AttributeKey.stringKey("workspace_name");
@@ -118,6 +136,62 @@ public abstract class OnlineScoringBaseScorer<M extends WorkspaceScopedMessage> 
             }
         }
         return Mono.error(error);
+    }
+
+    /**
+     * Lists an entity's attachments while tolerating the upload race (see
+     * {@link #ATTACHMENT_FETCH_MAX_RETRIES}). Shared by the trace- and span-level scorers when building
+     * the injected {@code {{trace}}} / {@code {{span}}} structure.
+     *
+     * <p>An upload exists transiently as an <em>auto-stripped</em> copy ({@code input-attachment-N-ts.ext},
+     * no {@code -sdk}) that is <strong>deleted</strong> once the persistent copy (e.g. {@code …-sdk.jpg})
+     * lands. A listing taken mid-race can therefore contain only the soon-to-404 transient name. So when
+     * any of {@code bodyNodes} (the entity's input/output/metadata) references an attachment, the cold
+     * lookup is resubscribed a few times with a short delay until a <em>persistent</em> (non-auto-stripped)
+     * attachment appears, and transient copies are dropped whenever a persistent one is present (so the
+     * judge is never handed a name that will 404). Entities with no attachment reference skip the retry
+     * (the common case). If the retry budget is exhausted — e.g. a REST-ingested image whose only copy is
+     * auto-stripped and never replaced — it falls back to a best-effort final read rather than dropping it.
+     *
+     * @param coldFetch the attachment lookup — must be cold (re-runs the query on each subscription)
+     * @param bodyNodes the entity's content nodes scanned for attachment references
+     */
+    protected static Mono<List<AttachmentInfo>> listAttachmentsToleratingUploadRace(
+            @NonNull Mono<List<AttachmentInfo>> coldFetch, JsonNode... bodyNodes) {
+        boolean expectsAttachment = AttachmentUtils.hasAttachmentReferences(JsonUtils.getMapper(), bodyNodes);
+        if (!expectsAttachment) {
+            return coldFetch.map(OnlineScoringBaseScorer::preferPersistentAttachments).onErrorReturn(List.of());
+        }
+        return coldFetch
+                .map(OnlineScoringBaseScorer::preferPersistentAttachments)
+                .filter(OnlineScoringBaseScorer::hasPersistentAttachment)
+                .repeatWhenEmpty(ATTACHMENT_FETCH_MAX_RETRIES,
+                        repeats -> repeats.delayElements(ATTACHMENT_FETCH_RETRY_DELAY))
+                .onErrorResume(error -> Mono.empty())
+                // Retries exhausted (no persistent copy will come): best-effort final read so a
+                // backend-/REST-only auto-stripped attachment is still surfaced rather than dropped.
+                .switchIfEmpty(Mono.defer(() -> coldFetch
+                        .map(OnlineScoringBaseScorer::preferPersistentAttachments)
+                        .onErrorReturn(List.of())));
+    }
+
+    /**
+     * When both a transient auto-stripped copy and a persistent copy of an upload are present, drops the
+     * auto-stripped one (it is deleted once the persistent copy lands, so surfacing it hands the judge a
+     * name that 404s). When only auto-stripped copies exist (a backend-/REST-ingested image with no SDK
+     * copy), they are the real attachments and are kept as-is.
+     */
+    private static List<AttachmentInfo> preferPersistentAttachments(List<AttachmentInfo> attachments) {
+        if (!hasPersistentAttachment(attachments)) {
+            return attachments;
+        }
+        return attachments.stream()
+                .filter(attachment -> !AttachmentUtils.isAutoStrippedAttachment(attachment.fileName()))
+                .collect(Collectors.toList());
+    }
+
+    private static boolean hasPersistentAttachment(List<AttachmentInfo> attachments) {
+        return attachments.stream().anyMatch(a -> !AttachmentUtils.isAutoStrippedAttachment(a.fileName()));
     }
 
     /**

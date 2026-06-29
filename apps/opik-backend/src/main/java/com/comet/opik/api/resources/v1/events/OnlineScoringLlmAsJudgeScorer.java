@@ -224,18 +224,20 @@ public class OnlineScoringLlmAsJudgeScorer extends OnlineScoringBaseScorer<Trace
      * span-level evals.
      */
     private Mono<String> buildTraceStructure(Trace trace, List<Span> spans, TraceToScoreLlmAsJudge message) {
-        return attachmentService
+        Mono<List<com.comet.opik.api.attachment.AttachmentInfo>> fetch = attachmentService
                 .getAttachmentInfoByEntity(trace.id(), com.comet.opik.api.attachment.EntityType.TRACE,
                         trace.projectId())
-                .onErrorReturn(List.of())
                 .contextWrite(ctx -> ctx
                         .put(RequestContext.WORKSPACE_ID, message.workspaceId())
-                        .put(RequestContext.USER_NAME, message.userName()))
+                        .put(RequestContext.USER_NAME, message.userName()));
+        // Tolerate the attachment-upload race (a trace's attachment may not be uploaded yet when scoring
+        // reads the table), gated on the trace body actually referencing an attachment.
+        return listAttachmentsToleratingUploadRace(fetch, trace.input(), trace.output(), trace.metadata())
                 .map(traceAttachments -> {
                     JsonNode fullJson = traceCompressor.buildFullJson(trace, spans);
-                    // No span attachments on a trace-level eval — only the trace's own attachments are listed.
+                    // Only the trace's own attachments are listed on a trace-level eval.
                     var compressed = traceCompressor.compress(fullJson, trace, spans, CompressionTier.FULL,
-                            Map.of(), traceAttachments);
+                            traceAttachments);
                     // compress() is id-agnostic; add the id envelope on top here, mirroring ReadTool.
                     ObjectNode envelope = JsonUtils.getMapper().createObjectNode();
                     envelope.put("trace_id", trace.id() != null ? trace.id().toString() : null);

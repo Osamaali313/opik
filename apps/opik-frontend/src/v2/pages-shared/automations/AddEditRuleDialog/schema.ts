@@ -267,8 +267,12 @@ export const LLMJudgeDetailsSpanFormSchema = LLMJudgeBaseSchema.extend({
     z
       .string()
       .min(1, { message: "Key is required" })
-      .regex(/^(input|output|metadata)(\.|$)/, {
-        message: `Key is invalid, it should be "input", "output", "metadata", and follow this format: "input.[PATH]" For example: "input.message" or just "input" for the whole object`,
+      // Allow the standard JSONPath form (input/output/metadata.[...]) OR the reserved
+      // bare sentinel `span` — see RESERVED_SPAN_LLM_JUDGE_VARIABLES. The backend's
+      // OnlineScoringEngine substitutes `span` with the span structure (span id +
+      // attachment file_names) at render time.
+      .regex(/^(input|output|metadata)(\.|$)|^span$/, {
+        message: `Key is invalid, it should be "input", "output", "metadata" (e.g. "input.message" or just "input" for the whole object), or the reserved word "span" to inject the span with its attachments`,
       }),
   ),
 }).superRefine((data, ctx) => {
