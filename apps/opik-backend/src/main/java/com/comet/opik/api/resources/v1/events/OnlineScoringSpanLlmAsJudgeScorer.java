@@ -126,20 +126,23 @@ public class OnlineScoringSpanLlmAsJudgeScorer extends OnlineScoringBaseScorer<S
                 UserLog.SPAN_ID, span.id().toString(),
                 UserLog.RULE_ID, message.ruleId().toString());
 
-        // Presence of the {{span}} variable is the declarative agentic trigger: it injects the span
-        // structure (span id + the span's own attachment file_names) into the prompt so the judge can
-        // call get_attachment(type=span, ...) with real ids instead of guessing. Gated by the
-        // agentic-tools toggle.
-        boolean referencesSpan = serviceTogglesConfig.isAgenticToolsEnabled()
-                && OnlineScoringEngine.templateReferencesSpanStructure(
-                        message.llmAsJudgeCode().messages(),
-                        message.llmAsJudgeCode().variables(),
-                        PromptType.MUSTACHE);
+        // The {{span}} variable is the declarative agentic trigger. Detection is independent of the
+        // agentic-tools toggle so the variable is always substituted (never leaking the bare "span"
+        // sentinel as a literal):
+        //   - toggle ON  → build the real span structure (span id + attachment file_names); if the
+        //                  provider supports tools, run the agentic loop so the judge can get_attachment.
+        //   - toggle OFF → skip the attachment fetch and inject a null structure, so {{span}} renders as
+        //                  "{}" inline (handled by the inline branch in prepareEvaluation).
+        boolean referencesSpan = OnlineScoringEngine.templateReferencesSpanStructure(
+                message.llmAsJudgeCode().messages(),
+                message.llmAsJudgeCode().variables(),
+                PromptType.MUSTACHE);
+        boolean agenticToolsEnabled = serviceTogglesConfig.isAgenticToolsEnabled();
 
-        Mono<List<FeedbackScoreBatchItem>> scoresMono = referencesSpan
+        Mono<List<FeedbackScoreBatchItem>> scoresMono = (referencesSpan && agenticToolsEnabled)
                 ? buildSpanStructure(span, message)
                         .flatMap(structure -> evaluate(message, structure, true, mdc))
-                : evaluate(message, null, false, mdc);
+                : evaluate(message, null, referencesSpan, mdc);
 
         return scoresMono
                 .flatMap(scores -> storeSpanScores(scores, span, message.userName(), message.workspaceId()))
@@ -227,11 +230,14 @@ public class OnlineScoringSpanLlmAsJudgeScorer extends OnlineScoringBaseScorer<S
             userFacingLogger.info("Evaluating spanId '{}' sampled by rule '{}'", span.id(), message.ruleName());
 
             String modelName = message.llmAsJudgeCode().model().name();
+            boolean agenticToolsEnabled = serviceTogglesConfig.isAgenticToolsEnabled();
             boolean providerSupportsTools = OnlineScoringEngine.supportsToolCalling(
                     llmProviderFactory.getLlmProvider(modelName));
-            boolean useTools = referencesSpan && providerSupportsTools;
+            // Tools require the {{span}} trigger AND the agentic-tools toggle AND a tool-calling provider.
+            // The {{span}} substitution itself is independent of tools — see the inline branch below.
+            boolean useTools = referencesSpan && agenticToolsEnabled && providerSupportsTools;
 
-            if (referencesSpan && !providerSupportsTools) {
+            if (referencesSpan && agenticToolsEnabled && !providerSupportsTools) {
                 // Actionable misconfiguration: the prompt references {{span}} (so the user expects
                 // tool-driven inspection / attachment loading) but the chosen model's provider can't
                 // call tools. We still inject the structure inline so the judge at least sees the ids.
@@ -265,7 +271,9 @@ public class OnlineScoringSpanLlmAsJudgeScorer extends OnlineScoringBaseScorer<S
                     // handleToolCalls so the model can decide when to stop investigating.
                     scoreRequest = OnlineScoringEngine.addToolSpecs(scoreRequest, ToolChoice.REQUIRED, toolRegistry);
                 } else if (referencesSpan) {
-                    // Inline fallback but still inject the {{span}} structure so the variable renders.
+                    // Inline path that still injects the {{span}} structure so the variable renders rather
+                    // than leaking the bare sentinel. Covers two cases: toggle OFF (spanStructureJson is
+                    // null → renders "{}") and toggle ON but a non-tool-calling provider (real structure).
                     scoreRequest = OnlineScoringEngine.prepareSpanLlmRequest(
                             message.llmAsJudgeCode(), span,
                             llmProviderFactory.getStructuredOutputStrategy(modelName), spanStructureJson);

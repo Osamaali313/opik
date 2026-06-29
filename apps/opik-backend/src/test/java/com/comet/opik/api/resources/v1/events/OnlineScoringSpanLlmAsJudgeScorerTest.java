@@ -313,6 +313,31 @@ class OnlineScoringSpanLlmAsJudgeScorerTest {
     }
 
     @Test
+    void spanVariableWithToggleOffRendersEmptyStructureWithoutToolsOrFetch() {
+        var code = JsonUtils.readValue(EVALUATOR_JSON_WITH_SPAN, SpanLlmAsJudgeCode.class);
+        var span = createSpan();
+        var message = buildMessage(span, code);
+
+        // Agentic tools OFF, but the prompt references {{span}}. We must NOT fetch attachments or attach
+        // tools — yet {{span}} must still render (as "{}"), never the literal sentinel word "span".
+        when(serviceTogglesConfig.isAgenticToolsEnabled()).thenReturn(false);
+        when(llmProviderFactory.getLlmProvider("gpt-test")).thenReturn(LlmProvider.OPEN_AI);
+        when(llmProviderFactory.getStructuredOutputStrategy("gpt-test")).thenReturn(new ToolCallingStrategy());
+        ArgumentCaptor<ChatRequest> requestCaptor = ArgumentCaptor.forClass(ChatRequest.class);
+        when(aiProxyService.scoreTrace(requestCaptor.capture(), any(), any()))
+                .thenReturn(ChatResponse.builder().aiMessage(AiMessage.aiMessage(LLM_RESPONSE)).build());
+        when(feedbackScoreService.scoreBatchOfSpans(any())).thenReturn(Mono.empty());
+
+        scorer.score(message).block();
+
+        assertThat(requestCaptor.getValue().toolSpecifications()).isNullOrEmpty();
+        verifyNoInteractions(attachmentService);
+        String prompt = ((UserMessage) requestCaptor.getValue().messages().get(0)).singleText();
+        assertThat(prompt).contains("Score this span: {}");
+        assertThat(prompt).doesNotContain("{{span}}");
+    }
+
+    @Test
     void noSpanVariableUsesInlinePathWithoutToolsOrAttachmentFetch() {
         var code = JsonUtils.readValue(EVALUATOR_JSON_INLINE, SpanLlmAsJudgeCode.class);
         var span = createSpan();
